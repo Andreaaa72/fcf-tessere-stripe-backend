@@ -1,11 +1,12 @@
 // =====================================================================
-// STRIPE BACKEND - Node.js Express per Railway
+// STRIPE BACKEND CON CODICI SBLOCCO LIMITATI A 3 UTILIZZI
 // =====================================================================
 
 const express = require('express');
 const cors = require('cors');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || 'sk_test_YOUR_KEY');
 const bodyParser = require('body-parser');
+const { Pool } = require('pg');
 
 const app = express();
 
@@ -15,18 +16,85 @@ app.use(bodyParser.json());
 app.use(express.raw({type: 'application/json'}));
 
 // =====================================================================
+// DATABASE PostgreSQL
+// =====================================================================
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+const MAX_UNLOCK_USES = 3; // LIMITE: Ogni codice può essere usato solo 3 volte
+
+// Crea le tabelle al startup
+pool.query(`
+    CREATE TABLE IF NOT EXISTS paid_devices (
+        id SERIAL PRIMARY KEY,
+        device_id VARCHAR(255) UNIQUE NOT NULL,
+        payment_intent_id VARCHAR(255),
+        unlock_code VARCHAR(50) UNIQUE NOT NULL,
+        paid_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        amount INTEGER,
+        currency VARCHAR(3),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+`, (err) => {
+    if (err) {
+        console.error('❌ Errore creazione tabella paid_devices:', err);
+    } else {
+        console.log('✅ Tabella paid_devices verificata');
+    }
+});
+
+pool.query(`
+    CREATE TABLE IF NOT EXISTS unlock_codes (
+        id SERIAL PRIMARY KEY,
+        unlock_code VARCHAR(50) UNIQUE NOT NULL,
+        device_id VARCHAR(255),
+        payment_intent_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        used_count INTEGER DEFAULT 0,
+        last_used TIMESTAMP,
+        active BOOLEAN DEFAULT true
+    );
+`, (err) => {
+    if (err) {
+        console.error('❌ Errore creazione tabella unlock_codes:', err);
+    } else {
+        console.log('✅ Tabella unlock_codes verificata');
+    }
+});
+
+// =====================================================================
+// FUNZIONE: Genera codice di sblocco univoco
+// =====================================================================
+
+function generateUnlockCode() {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789';
+    let code = 'FCF';
+    
+    for (let i = 0; i < 3; i++) {
+        code += '-';
+        for (let j = 0; j < 4; j++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+    }
+    
+    return code;
+}
+
+// =====================================================================
 // ENDPOINT 1: Crea Payment Intent
 // =====================================================================
-// IMPORTANTE: Questo endpoint è usato dall'app Android
 app.post('/create-payment-intent', async (req, res) => {
     try {
         console.log('📨 Ricevuta richiesta: create-payment-intent');
-        const { amount, currency = 'eur', description } = req.body;
+        const { amount, currency = 'eur', description, deviceId } = req.body;
 
-        // Se amount non è specificato, usa 100 (€1,00)
         const finalAmount = amount || 100;
 
         console.log(`💳 Creando Payment Intent: ${finalAmount} ${currency.toUpperCase()}`);
+        console.log(`📱 Device ID: ${deviceId}`);
 
         const paymentIntent = await stripe.paymentIntents.create({
             amount: Math.round(finalAmount),
@@ -34,14 +102,13 @@ app.post('/create-payment-intent', async (req, res) => {
             description: description || 'FCF Tessere Premium',
             metadata: {
                 app: 'fcf-tessere',
+                deviceId: deviceId,
                 timestamp: new Date().toISOString()
             }
         });
 
         console.log(`✅ Payment Intent creato: ${paymentIntent.id}`);
-        console.log(`📝 Client Secret: ${paymentIntent.client_secret?.substring(0, 20)}...`);
 
-        // IMPORTANTE: Ritorna clientSecret e publishableKey
         res.json({
             clientSecret: paymentIntent.client_secret,
             publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || 'pk_test_YOUR_KEY',
@@ -61,42 +128,87 @@ app.post('/create-payment-intent', async (req, res) => {
 });
 
 // =====================================================================
-// ENDPOINT 2: Alias per compatibilità (con /api prefix)
+// ENDPOINT 2: Registra device come pagato E genera codice
 // =====================================================================
-app.post('/api/create-payment-intent', async (req, res) => {
-    // Delega al primo endpoint
-    app._router.stack.find(r => r.route && r.route.path === '/create-payment-intent').route.stack[0].handle(req, res);
-});
-
-// =====================================================================
-// ENDPOINT 3: Verifica il Pagamento
-// =====================================================================
-app.get('/api/verify-payment', async (req, res) => {
+app.post('/register-paid-device', async (req, res) => {
     try {
-        const { paymentIntentId } = req.query;
-        console.log(`📨 Ricevuta richiesta: verify-payment per ${paymentIntentId}`);
+        const { deviceId, paymentIntentId, amount, currency } = req.body;
 
-        if (!paymentIntentId) {
+        if (!deviceId || !paymentIntentId) {
             return res.status(400).json({ 
-                error: 'paymentIntentId è obbligatorio' 
+                error: 'deviceId e paymentIntentId sono obbligatori' 
             });
         }
 
+        console.log(`💳 Registrando device pagato: ${deviceId}`);
+        console.log(`   Payment Intent: ${paymentIntentId}`);
+
+        // Verifica che il PaymentIntent sia reale e completato
         const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
-        console.log(`✅ Payment Intent verificato: ${paymentIntent.id} - Status: ${paymentIntent.status}`);
+        if (paymentIntent.status !== 'succeeded') {
+            console.log(`❌ PaymentIntent non completato: ${paymentIntent.status}`);
+            return res.status(400).json({ 
+                error: 'PaymentIntent non completato',
+                status: paymentIntent.status
+            });
+        }
+
+        console.log(`✅ PaymentIntent verificato: ${paymentIntent.status}`);
+
+        // Genera un codice di sblocco univoco
+        let unlockCode = generateUnlockCode();
+        let attempts = 0;
+        const maxAttempts = 10;
+
+        while (attempts < maxAttempts) {
+            const existingCode = await pool.query(
+                'SELECT * FROM unlock_codes WHERE unlock_code = $1',
+                [unlockCode]
+            );
+            
+            if (existingCode.rows.length === 0) {
+                break;
+            }
+            
+            unlockCode = generateUnlockCode();
+            attempts++;
+        }
+
+        console.log(`🔑 Codice di sblocco generato: ${unlockCode}`);
+        console.log(`   📊 Limite utilizzi: ${MAX_UNLOCK_USES}`);
+
+        // Inserisci il codice nella tabella unlock_codes
+        await pool.query(
+            `INSERT INTO unlock_codes (unlock_code, device_id, payment_intent_id, active, used_count) 
+             VALUES ($1, $2, $3, true, 0)`,
+            [unlockCode, deviceId, paymentIntentId]
+        );
+
+        // Inserisci nel database paid_devices
+        await pool.query(
+            `INSERT INTO paid_devices (device_id, payment_intent_id, unlock_code, amount, currency) 
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (device_id) DO UPDATE 
+             SET payment_intent_id = $2, unlock_code = $3, amount = $4, currency = $5, paid_at = CURRENT_TIMESTAMP
+             RETURNING *`,
+            [deviceId, paymentIntentId, unlockCode, amount || 100, currency || 'eur']
+        );
+
+        console.log(`✅ Device registrato con codice limitato a ${MAX_UNLOCK_USES} utilizzi`);
 
         res.json({
-            id: paymentIntent.id,
-            status: paymentIntent.status,
-            amount: paymentIntent.amount,
-            currency: paymentIntent.currency,
-            created: paymentIntent.created,
-            customer: paymentIntent.customer
+            success: true,
+            deviceId: deviceId,
+            paymentIntentId: paymentIntentId,
+            unlockCode: unlockCode,
+            maxUses: MAX_UNLOCK_USES,
+            message: `Codice valido per ${MAX_UNLOCK_USES} dispositivi. Salva il codice!`,
+            timestamp: new Date().toISOString()
         });
 
     } catch (error) {
-        console.error('❌ Errore verify-payment:', error.message);
+        console.error('❌ Errore register-paid-device:', error.message);
         res.status(500).json({ 
             error: error.message 
         });
@@ -104,7 +216,149 @@ app.get('/api/verify-payment', async (req, res) => {
 });
 
 // =====================================================================
-// ENDPOINT 4: Webhook Stripe
+// ENDPOINT 3: Verifica codice di sblocco (CON LIMITE 3 UTILIZZI)
+// =====================================================================
+app.post('/verify-unlock-code', async (req, res) => {
+    try {
+        const { unlockCode } = req.body;
+
+        if (!unlockCode) {
+            return res.status(400).json({ 
+                error: 'unlockCode è obbligatorio' 
+            });
+        }
+
+        console.log(`🔑 Verificando codice: ${unlockCode}`);
+
+        // Cerca il codice nella tabella unlock_codes
+        const result = await pool.query(
+            'SELECT * FROM unlock_codes WHERE unlock_code = $1',
+            [unlockCode]
+        );
+
+        if (result.rows.length === 0) {
+            console.log(`❌ Codice non trovato: ${unlockCode}`);
+            return res.json({
+                valid: false,
+                message: 'Codice non valido',
+                usesRemaining: 0
+            });
+        }
+
+        const codeRecord = result.rows[0];
+
+        // Controlla se il codice è attivo
+        if (!codeRecord.active) {
+            console.log(`❌ Codice disattivato: ${unlockCode}`);
+            return res.json({
+                valid: false,
+                message: 'Questo codice non è più attivo',
+                usesRemaining: 0
+            });
+        }
+
+        // CRITICO: Controlla il limite di 3 utilizzi
+        if (codeRecord.used_count >= MAX_UNLOCK_USES) {
+            console.log(`❌ LIMITE RAGGIUNTO: Codice ${unlockCode} (utilizzi: ${codeRecord.used_count}/${MAX_UNLOCK_USES})`);
+            
+            // Disattiva il codice
+            await pool.query(
+                'UPDATE unlock_codes SET active = false WHERE unlock_code = $1',
+                [unlockCode]
+            );
+            
+            console.log(`⛔ Codice disattivato automaticamente`);
+            
+            return res.json({
+                valid: false,
+                message: `Codice raggiunto il limite di ${MAX_UNLOCK_USES} utilizzi. Non è più valido.`,
+                usesRemaining: 0,
+                limitReached: true
+            });
+        }
+
+        // Incrementa il contatore
+        const usesRemaining = MAX_UNLOCK_USES - codeRecord.used_count - 1;
+        
+        await pool.query(
+            `UPDATE unlock_codes 
+             SET used_count = used_count + 1, last_used = CURRENT_TIMESTAMP 
+             WHERE unlock_code = $1`,
+            [unlockCode]
+        );
+
+        console.log(`✅ Codice verificato: ${unlockCode}`);
+        console.log(`   Utilizzi rimanenti: ${usesRemaining}/${MAX_UNLOCK_USES}`);
+
+        res.json({
+            valid: true,
+            unlockCode: unlockCode,
+            originalDeviceId: codeRecord.device_id,
+            usedCount: codeRecord.used_count + 1,
+            usesRemaining: usesRemaining,
+            maxUses: MAX_UNLOCK_USES,
+            message: usesRemaining > 0 
+                ? `Codice valido! (${usesRemaining} utilizzi rimasti)`
+                : `Attenzione: ultimo utilizzo per questo codice!`,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('❌ Errore verify-unlock-code:', error.message);
+        res.status(500).json({ 
+            error: error.message 
+        });
+    }
+});
+
+// =====================================================================
+// ENDPOINT 4: Verifica se device è sbloccato
+// =====================================================================
+app.post('/verify-device', async (req, res) => {
+    try {
+        const { deviceId } = req.body;
+
+        if (!deviceId) {
+            return res.status(400).json({ 
+                error: 'deviceId è obbligatorio' 
+            });
+        }
+
+        console.log(`📱 Verifica device: ${deviceId}`);
+
+        const result = await pool.query(
+            'SELECT * FROM paid_devices WHERE device_id = $1',
+            [deviceId]
+        );
+
+        const isUnlocked = result.rows.length > 0;
+
+        if (isUnlocked) {
+            console.log(`✅ Device ${deviceId} è SBLOCCATO`);
+            console.log(`   Codice: ${result.rows[0].unlock_code}`);
+        } else {
+            console.log(`❌ Device ${deviceId} è BLOCCATO`);
+        }
+
+        res.json({
+            deviceId: deviceId,
+            isUnlocked: isUnlocked,
+            unlockCode: isUnlocked ? result.rows[0].unlock_code : null,
+            paidAt: isUnlocked ? result.rows[0].paid_at : null,
+            amount: isUnlocked ? result.rows[0].amount : null,
+            timestamp: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error('❌ Errore verify-device:', error.message);
+        res.status(500).json({ 
+            error: error.message 
+        });
+    }
+});
+
+// =====================================================================
+// ENDPOINT 5: Webhook Stripe
 // =====================================================================
 app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) => {
     const sig = req.headers['stripe-signature'];
@@ -141,7 +395,7 @@ app.post('/webhook', express.raw({type: 'application/json'}), async (req, res) =
 });
 
 // =====================================================================
-// ENDPOINT 5: Health Check
+// ENDPOINT 6: Health Check
 // =====================================================================
 app.get('/health', (req, res) => {
     res.json({ 
@@ -152,31 +406,51 @@ app.get('/health', (req, res) => {
 });
 
 // =====================================================================
-// ENDPOINT 6: Test Info
+// ENDPOINT 7: Test Info
 // =====================================================================
-app.get('/info', (req, res) => {
-    const hasSecretKey = !!process.env.STRIPE_SECRET_KEY;
-    const hasPublishableKey = !!process.env.STRIPE_PUBLISHABLE_KEY;
-    const hasWebhookSecret = !!process.env.STRIPE_WEBHOOK_SECRET && 
-                              process.env.STRIPE_WEBHOOK_SECRET !== 'whsec_test_secret';
+app.get('/info', async (req, res) => {
+    try {
+        const dbResult = await pool.query('SELECT COUNT(*) as count FROM paid_devices');
+        const codesResult = await pool.query('SELECT COUNT(*) as count FROM unlock_codes WHERE active = true');
+        const deactivatedResult = await pool.query('SELECT COUNT(*) as count FROM unlock_codes WHERE active = false');
+        
+        const paidDevicesCount = dbResult.rows[0].count;
+        const activeCodesCount = codesResult.rows[0].count;
+        const deactivatedCodesCount = deactivatedResult.rows[0].count;
 
-    res.json({
-        app: 'FCF Tessere Stripe Backend',
-        version: '1.0.0',
-        endpoints: {
-            health: 'GET /health',
-            createPaymentIntent: 'POST /create-payment-intent',
-            createPaymentIntentApi: 'POST /api/create-payment-intent',
-            verifyPayment: 'GET /api/verify-payment?paymentIntentId=...',
-            webhook: 'POST /webhook'
-        },
-        configuration: {
-            stripeSecretKeySet: hasSecretKey ? '✅ Configurato' : '❌ NON configurato',
-            stripePublishableKeySet: hasPublishableKey ? '✅ Configurato' : '❌ NON configurato',
-            webhookSecretSet: hasWebhookSecret ? '✅ Configurato correttamente' : '⚠️ FAKE (usa whsec_test_secret)',
-            nodeEnvironment: process.env.NODE_ENV || 'development'
-        }
-    });
+        res.json({
+            app: 'FCF Tessere Stripe Backend',
+            version: '3.1.0',
+            features: {
+                unlockCodesLimit: `Massimo ${MAX_UNLOCK_USES} utilizzi per codice`,
+                autoDeactivation: 'Codici disattivati automaticamente al raggiungimento del limite'
+            },
+            endpoints: {
+                health: 'GET /health',
+                createPaymentIntent: 'POST /create-payment-intent',
+                registerPaidDevice: 'POST /register-paid-device (genera codice limitato)',
+                verifyUnlockCode: 'POST /verify-unlock-code (con controllo limite)',
+                verifyDevice: 'POST /verify-device',
+                webhook: 'POST /webhook'
+            },
+            database: {
+                connected: true,
+                paidDevicesCount: parseInt(paidDevicesCount),
+                activeUnlockCodesCount: parseInt(activeCodesCount),
+                deactivatedCodesCount: parseInt(deactivatedCodesCount),
+                limitsEnforced: true
+            },
+            configuration: {
+                stripeSecretKeySet: !!process.env.STRIPE_SECRET_KEY ? '✅' : '❌',
+                stripePublishableKeySet: !!process.env.STRIPE_PUBLISHABLE_KEY ? '✅' : '❌',
+                databaseConfigured: !!process.env.DATABASE_URL ? '✅' : '❌'
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: error.message
+        });
+    }
 });
 
 // =====================================================================
@@ -184,20 +458,25 @@ app.get('/info', (req, res) => {
 // =====================================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`\n┌─────────────────────────────────────────┐`);
-    console.log(`│   🚀 STRIPE BACKEND - IN ESECUZIONE   │`);
-    console.log(`├─────────────────────────────────────────┤`);
+    console.log(`\n┌────────────────────────────────────────────────────────────┐`);
+    console.log(`│  🚀 STRIPE BACKEND v3.1 - CODICI LIMITATI A ${MAX_UNLOCK_USES} UTILIZZI   │`);
+    console.log(`├────────────────────────────────────────────────────────────┤`);
     console.log(`│ Porta: ${PORT}`);
     console.log(`│ URL: http://localhost:${PORT}`);
-    console.log(`├─────────────────────────────────────────┤`);
+    console.log(`│ Database: PostgreSQL (Railway)`);
+    console.log(`│ Sicurezza: Ogni codice valido per max ${MAX_UNLOCK_USES} device`);
+    console.log(`│ Status: Protezione contro abuso attiva ✅`);
+    console.log(`├────────────────────────────────────────────────────────────┤`);
     console.log(`│ ENDPOINT DISPONIBILI:`);
     console.log(`│ GET  /health`);
     console.log(`│ GET  /info`);
-    console.log(`│ POST /create-payment-intent (per app)`);
-    console.log(`│ POST /api/create-payment-intent`);
-    console.log(`│ GET  /api/verify-payment`);
+    console.log(`│ POST /create-payment-intent`);
+    console.log(`│ POST /register-paid-device → Genera codice (${MAX_UNLOCK_USES} usi)`);
+    console.log(`│ POST /verify-unlock-code → Verifica + decrementa contatore`);
+    console.log(`│ POST /verify-device`);
     console.log(`│ POST /webhook`);
-    console.log(`└─────────────────────────────────────────┘\n`);
+    console.log(`└────────────────────────────────────────────────────────────┘\n`);
 });
 
 module.exports = app;
+
