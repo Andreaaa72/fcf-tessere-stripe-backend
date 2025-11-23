@@ -113,7 +113,7 @@ app.post('/create-payment-intent', async (req, res) => {
         console.log('📨 Ricevuta richiesta: create-payment-intent');
         const { amount, currency = 'eur', description, deviceId } = req.body;
 
-        const finalAmount = (amount || 1) * 100;
+        const finalAmount = (amount || 1.99) * 100;
 
         console.log(`💳 Creando Payment Intent: ${finalAmount} centesimi (${(finalAmount / 100).toFixed(2)}€)`);
         console.log(`📱 Device ID: ${deviceId}`);
