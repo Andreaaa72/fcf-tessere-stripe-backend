@@ -1,5 +1,6 @@
 // =====================================================================
 // STRIPE BACKEND CON CODICI SBLOCCO LIMITATI A 3 UTILIZZI
+// + CODICI MASTER SENZA LIMITI
 // =====================================================================
 
 const express = require('express');
@@ -24,7 +25,7 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
-const MAX_UNLOCK_USES = 3; // LIMITE: Ogni codice può essere usato solo 3 volte
+const MAX_UNLOCK_USES = 3;
 
 // Crea le tabelle al startup
 pool.query(`
@@ -55,7 +56,8 @@ pool.query(`
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         used_count INTEGER DEFAULT 0,
         last_used TIMESTAMP,
-        active BOOLEAN DEFAULT true
+        active BOOLEAN DEFAULT true,
+        unlimited BOOLEAN DEFAULT false
     );
 `, (err) => {
     if (err) {
@@ -84,6 +86,26 @@ function generateUnlockCode() {
 }
 
 // =====================================================================
+// INSERISCI CODICE MASTER AL STARTUP (UNA SOLA VOLTA)
+// =====================================================================
+
+const MASTER_CODE = 'FCF-A7K9-M2P4-X8Q1'; // Codice MASTER senza limiti
+
+pool.query(
+    `INSERT INTO unlock_codes (unlock_code, active, unlimited, used_count)
+     VALUES ($1, true, true, 0)
+     ON CONFLICT (unlock_code) DO NOTHING`,
+    [MASTER_CODE],
+    (err) => {
+        if (err) {
+            console.error('❌ Errore inserimento codice MASTER:', err);
+        } else {
+            console.log(`✅ Codice MASTER disponibile: ${MASTER_CODE}`);
+        }
+    }
+);
+
+// =====================================================================
 // ENDPOINT 1: Crea Payment Intent
 // =====================================================================
 app.post('/create-payment-intent', async (req, res) => {
@@ -91,9 +113,9 @@ app.post('/create-payment-intent', async (req, res) => {
         console.log('📨 Ricevuta richiesta: create-payment-intent');
         const { amount, currency = 'eur', description, deviceId } = req.body;
 
-        const finalAmount = (amount || 1) * 100; 
+        const finalAmount = (amount || 1) * 100;
 
-        console.log(`💳 Creando Payment Intent: ${finalAmount} ${currency.toUpperCase()}`);
+        console.log(`💳 Creando Payment Intent: ${finalAmount} centesimi (${(finalAmount / 100).toFixed(2)}€)`);
         console.log(`📱 Device ID: ${deviceId}`);
 
         const paymentIntent = await stripe.paymentIntents.create({
@@ -143,7 +165,6 @@ app.post('/register-paid-device', async (req, res) => {
         console.log(`💳 Registrando device pagato: ${deviceId}`);
         console.log(`   Payment Intent: ${paymentIntentId}`);
 
-        // Verifica che il PaymentIntent sia reale e completato
         const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
 
         if (paymentIntent.status !== 'succeeded') {
@@ -156,7 +177,6 @@ app.post('/register-paid-device', async (req, res) => {
 
         console.log(`✅ PaymentIntent verificato: ${paymentIntent.status}`);
 
-        // Genera un codice di sblocco univoco
         let unlockCode = generateUnlockCode();
         let attempts = 0;
         const maxAttempts = 10;
@@ -178,14 +198,12 @@ app.post('/register-paid-device', async (req, res) => {
         console.log(`🔑 Codice di sblocco generato: ${unlockCode}`);
         console.log(`   📊 Limite utilizzi: ${MAX_UNLOCK_USES}`);
 
-        // Inserisci il codice nella tabella unlock_codes
         await pool.query(
-            `INSERT INTO unlock_codes (unlock_code, device_id, payment_intent_id, active, used_count) 
-             VALUES ($1, $2, $3, true, 0)`,
+            `INSERT INTO unlock_codes (unlock_code, device_id, payment_intent_id, active, used_count, unlimited) 
+             VALUES ($1, $2, $3, true, 0, false)`,
             [unlockCode, deviceId, paymentIntentId]
         );
 
-        // Inserisci nel database paid_devices
         await pool.query(
             `INSERT INTO paid_devices (device_id, payment_intent_id, unlock_code, amount, currency) 
              VALUES ($1, $2, $3, $4, $5)
@@ -216,7 +234,7 @@ app.post('/register-paid-device', async (req, res) => {
 });
 
 // =====================================================================
-// ENDPOINT 3: Verifica codice di sblocco (CON LIMITE 3 UTILIZZI)
+// ENDPOINT 3: Verifica codice di sblocco
 // =====================================================================
 app.post('/verify-unlock-code', async (req, res) => {
     try {
@@ -228,40 +246,37 @@ app.post('/verify-unlock-code', async (req, res) => {
             });
         }
 
-        console.log(`🔑 Verificando codice: ${unlockCode}`);
+        console.log(`🔍 Verifica codice: ${unlockCode}`);
 
-        // Cerca il codice nella tabella unlock_codes
         const result = await pool.query(
             'SELECT * FROM unlock_codes WHERE unlock_code = $1',
             [unlockCode]
         );
 
         if (result.rows.length === 0) {
-            console.log(`❌ Codice non trovato: ${unlockCode}`);
+            console.log(`❌ Codice non trovato`);
             return res.json({
                 valid: false,
-                message: 'Codice non valido',
-                usesRemaining: 0
+                message: 'Codice non trovato',
+                limitReached: false
             });
         }
 
         const codeRecord = result.rows[0];
 
-        // Controlla se il codice è attivo
         if (!codeRecord.active) {
-            console.log(`❌ Codice disattivato: ${unlockCode}`);
+            console.log(`❌ Codice disattivato`);
             return res.json({
                 valid: false,
-                message: 'Questo codice non è più attivo',
-                usesRemaining: 0
+                message: 'Codice disattivato',
+                limitReached: false
             });
         }
 
-        // CRITICO: Controlla il limite di 3 utilizzi
-        if (codeRecord.used_count >= MAX_UNLOCK_USES) {
-            console.log(`❌ LIMITE RAGGIUNTO: Codice ${unlockCode} (utilizzi: ${codeRecord.used_count}/${MAX_UNLOCK_USES})`);
-            
-            // Disattiva il codice
+        // ✅ NUOVO: Controlla se è un codice UNLIMITED
+        const isUnlimited = codeRecord.unlimited === true;
+
+        if (!isUnlimited && codeRecord.used_count >= MAX_UNLOCK_USES) {
             await pool.query(
                 'UPDATE unlock_codes SET active = false WHERE unlock_code = $1',
                 [unlockCode]
@@ -277,8 +292,7 @@ app.post('/verify-unlock-code', async (req, res) => {
             });
         }
 
-        // Incrementa il contatore
-        const usesRemaining = MAX_UNLOCK_USES - codeRecord.used_count - 1;
+        const usesRemaining = isUnlimited ? Infinity : (MAX_UNLOCK_USES - codeRecord.used_count - 1);
         
         await pool.query(
             `UPDATE unlock_codes 
@@ -288,18 +302,25 @@ app.post('/verify-unlock-code', async (req, res) => {
         );
 
         console.log(`✅ Codice verificato: ${unlockCode}`);
-        console.log(`   Utilizzi rimanenti: ${usesRemaining}/${MAX_UNLOCK_USES}`);
+        if (isUnlimited) {
+            console.log(`   🔓 CODICE MASTER (Senza limiti)`);
+        } else {
+            console.log(`   Utilizzi rimanenti: ${usesRemaining}/${MAX_UNLOCK_USES}`);
+        }
 
         res.json({
             valid: true,
             unlockCode: unlockCode,
             originalDeviceId: codeRecord.device_id,
             usedCount: codeRecord.used_count + 1,
-            usesRemaining: usesRemaining,
-            maxUses: MAX_UNLOCK_USES,
-            message: usesRemaining > 0 
-                ? `Codice valido! (${usesRemaining} utilizzi rimasti)`
-                : `Attenzione: ultimo utilizzo per questo codice!`,
+            usesRemaining: isUnlimited ? null : usesRemaining,
+            maxUses: isUnlimited ? null : MAX_UNLOCK_USES,
+            isUnlimited: isUnlimited,
+            message: isUnlimited
+                ? `🔓 Codice MASTER valido! (Senza limiti)`
+                : usesRemaining > 0 
+                    ? `Codice valido! (${usesRemaining} utilizzi rimasti)`
+                    : `Attenzione: ultimo utilizzo per questo codice!`,
             timestamp: new Date().toISOString()
         });
 
@@ -413,17 +434,20 @@ app.get('/info', async (req, res) => {
         const dbResult = await pool.query('SELECT COUNT(*) as count FROM paid_devices');
         const codesResult = await pool.query('SELECT COUNT(*) as count FROM unlock_codes WHERE active = true');
         const deactivatedResult = await pool.query('SELECT COUNT(*) as count FROM unlock_codes WHERE active = false');
+        const masterResult = await pool.query('SELECT COUNT(*) as count FROM unlock_codes WHERE unlimited = true');
         
         const paidDevicesCount = dbResult.rows[0].count;
         const activeCodesCount = codesResult.rows[0].count;
         const deactivatedCodesCount = deactivatedResult.rows[0].count;
+        const masterCodesCount = masterResult.rows[0].count;
 
         res.json({
             app: 'FCF Tessere Stripe Backend',
-            version: '3.1.0',
+            version: '4.0.0',
             features: {
                 unlockCodesLimit: `Massimo ${MAX_UNLOCK_USES} utilizzi per codice`,
-                autoDeactivation: 'Codici disattivati automaticamente al raggiungimento del limite'
+                autoDeactivation: 'Codici disattivati automaticamente al raggiungimento del limite',
+                masterCodes: 'Supporto per codici MASTER senza limiti'
             },
             endpoints: {
                 health: 'GET /health',
@@ -438,13 +462,15 @@ app.get('/info', async (req, res) => {
                 paidDevicesCount: parseInt(paidDevicesCount),
                 activeUnlockCodesCount: parseInt(activeCodesCount),
                 deactivatedCodesCount: parseInt(deactivatedCodesCount),
+                masterCodesCount: parseInt(masterCodesCount),
                 limitsEnforced: true
             },
             configuration: {
                 stripeSecretKeySet: !!process.env.STRIPE_SECRET_KEY ? '✅' : '❌',
                 stripePublishableKeySet: !!process.env.STRIPE_PUBLISHABLE_KEY ? '✅' : '❌',
                 databaseConfigured: !!process.env.DATABASE_URL ? '✅' : '❌'
-            }
+            },
+            masterCodeAvailable: MASTER_CODE
         });
     } catch (error) {
         res.status(500).json({
@@ -459,12 +485,13 @@ app.get('/info', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`\n┌────────────────────────────────────────────────────────────┐`);
-    console.log(`│  🚀 STRIPE BACKEND v3.1 - CODICI LIMITATI A ${MAX_UNLOCK_USES} UTILIZZI   │`);
+    console.log(`│  🚀 STRIPE BACKEND v4.0 - CODICI LIMITATI + MASTER          │`);
     console.log(`├────────────────────────────────────────────────────────────┤`);
     console.log(`│ Porta: ${PORT}`);
     console.log(`│ URL: http://localhost:${PORT}`);
     console.log(`│ Database: PostgreSQL (Railway)`);
     console.log(`│ Sicurezza: Ogni codice valido per max ${MAX_UNLOCK_USES} device`);
+    console.log(`│ Master Code: ${MASTER_CODE} (Senza limiti)`);
     console.log(`│ Status: Protezione contro abuso attiva ✅`);
     console.log(`├────────────────────────────────────────────────────────────┤`);
     console.log(`│ ENDPOINT DISPONIBILI:`);
@@ -479,3 +506,4 @@ app.listen(PORT, () => {
 });
 
 module.exports = app;
+
